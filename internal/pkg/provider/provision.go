@@ -281,7 +281,7 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				if err != nil {
 					p.releaseNodeReservation(requestID)
 
-					return err
+					return fmt.Errorf("failed to check VM creation task %q on node %q (vmid=%d): %w", pctx.State.TypedSpec().Value.VmCreateTask, pctx.State.TypedSpec().Value.Node, pctx.State.TypedSpec().Value.Vmid, err)
 				}
 
 				if taskState == taskStatusRunning {
@@ -568,7 +568,7 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 			if err != nil {
 				p.releaseNodeReservation(requestID)
 
-				return err
+				return fmt.Errorf("failed to create VM %q on node %q (vmid=%d, cpu=%s, storage=%s, iso=%s, network=%s): %w", pctx.GetRequestID(), node.Name, vmid, cpuType, selectedStorage, iso.VolID, networkString, err)
 			}
 
 			pctx.State.TypedSpec().Value.VmCreateTask = string(task.UPID)
@@ -705,7 +705,6 @@ func (p *Provisioner) pickStorage(ctx context.Context, node *proxmox.Node, selec
 
 	return "", fmt.Errorf("failed to pick the disk: no matches for the condition %q", selector)
 }
-
 func (p *Provisioner) getVM(ctx context.Context, nodeName string, vmid int32) (*proxmox.VirtualMachine, error) {
 	node, err := p.proxmoxClient.Node(ctx, nodeName)
 	if err != nil {
