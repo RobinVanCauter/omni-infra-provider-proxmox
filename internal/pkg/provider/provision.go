@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -34,12 +35,16 @@ const machineRequestTagPrefix = "machine-request."
 // Provisioner implements Talos emulator infra provider.
 type Provisioner struct {
 	proxmoxClient *proxmox.Client
+
+	reservationsMu sync.Mutex
+	reservations   map[string]nodeReservation
 }
 
 // NewProvisioner creates a new provisioner.
 func NewProvisioner(proxmoxClient *proxmox.Client) *Provisioner {
 	return &Provisioner{
 		proxmoxClient: proxmoxClient,
+		reservations:  make(map[string]nodeReservation),
 	}
 }
 
@@ -64,34 +69,80 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				return fmt.Errorf("no nodes available")
 			}
 
+			requestID := pctx.GetRequestID()
+			machineRequestSetID, hasMachineRequestSet := pctx.GetMachineRequestSetID()
+			nodeStatuses := make(map[string]string, len(nodes))
+
+			for _, node := range nodes {
+				nodeStatuses[node.Node] = node.Status
+			}
+
 			// If user specified a node, validate and use it
 			if data.Node != "" {
-				for _, node := range nodes {
-					if node.Node == data.Node {
-						if node.Status != "online" {
-							return fmt.Errorf("specified node %q is not online (status: %s)", data.Node, node.Status)
-						}
+				status, ok := nodeStatuses[data.Node]
+				if !ok {
+					return fmt.Errorf("specified node %q not found in cluster", data.Node)
+				}
 
-						pctx.State.TypedSpec().Value.Node = data.Node
+				if status != "online" {
+					return fmt.Errorf("specified node %q is not online (status: %s)", data.Node, status)
+				}
 
-						logger.Info("using configured node for the Proxmox VM", zap.String("node", data.Node))
+				pctx.State.TypedSpec().Value.Node = data.Node
+
+				if hasMachineRequestSet {
+					p.reserveNodeReservation(machineRequestSetID, requestID, data.Node)
+				} else {
+					p.releaseNodeReservation(requestID)
+				}
+
+				logger.Info("using configured node for the Proxmox VM", zap.String("node", data.Node))
+
+				return nil
+			}
+
+			if currentNode := pctx.State.TypedSpec().Value.Node; currentNode != "" {
+				if nodeStatuses[currentNode] == "online" {
+					if hasMachineRequestSet {
+						p.reserveNodeReservation(machineRequestSetID, requestID, currentNode)
+					} else {
+						p.releaseNodeReservation(requestID)
+					}
+
+					logger.Info("reusing previously selected node for the Proxmox VM", zap.String("node", currentNode))
+
+					return nil
+				}
+
+				p.releaseNodeReservation(requestID)
+				pctx.State.TypedSpec().Value.Node = ""
+			}
+
+			if hasMachineRequestSet {
+				if reservation, ok := p.getNodeReservation(requestID); ok {
+					if reservation.MachineRequestSetID == machineRequestSetID && nodeStatuses[reservation.Node] == "online" {
+						pctx.State.TypedSpec().Value.Node = reservation.Node
+
+						logger.Info("reusing reserved node for the Proxmox VM", zap.String("node", reservation.Node))
 
 						return nil
 					}
-				}
 
-				return fmt.Errorf("specified node %q not found in cluster", data.Node)
+					p.releaseNodeReservation(requestID)
+				}
+			} else {
+				p.releaseNodeReservation(requestID)
 			}
 
 			nodeInfoList := make([]nodeStatus, 0, len(nodes))
 
 			for _, node := range nodes {
-				var ns nodeStatus
+				ns, ok := newNodeStatus(node.Node, node.Status, node.MaxMem, node.Mem)
+				if !ok {
+					continue
+				}
 
-				ns.Name = node.Node
-				ns.MemoryFree = float64(node.MaxMem-node.Mem) / float64(node.MaxMem)
-
-				if machineRequestSet, ok := pctx.GetMachineRequestSetID(); ok {
+				if hasMachineRequestSet {
 					n, err := p.proxmoxClient.Node(ctx, node.Node)
 					if err != nil {
 						return fmt.Errorf("failed to get node %q, %w", node.Node, err)
@@ -103,18 +154,28 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 					}
 
 					for _, vm := range vms {
-						if vm.HasTag(machineRequestTagPrefix + machineRequestSet) {
+						if vm.HasTag(machineRequestTagPrefix + machineRequestSetID) {
 							ns.SameMachineRequestSetVMs += 1
 						}
 					}
+
+					ns.SameMachineRequestSetVMs += p.countNodeReservations(machineRequestSetID, requestID, node.Node)
 				}
 
 				nodeInfoList = append(nodeInfoList, ns)
 			}
 
+			if len(nodeInfoList) == 0 {
+				return fmt.Errorf("no online nodes available")
+			}
+
 			pickedNode := pickNode(nodeInfoList)
 
 			pctx.State.TypedSpec().Value.Node = pickedNode.Name
+
+			if hasMachineRequestSet {
+				p.reserveNodeReservation(machineRequestSetID, requestID, pickedNode.Name)
+			}
 
 			logger.Info("auto-selected node for the Proxmox VM", zap.String("node", pickedNode.Name))
 
@@ -136,13 +197,17 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 		}),
 		provision.NewStep("uploadISO", func(ctx context.Context, logger *zap.Logger, pctx provision.Context[*resources.Machine]) error {
 			if pctx.State.TypedSpec().Value.VolumeUploadTask != "" {
-				err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VolumeUploadTask)
+				taskState, err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VolumeUploadTask)
 				if err != nil && err.Error() != "stopped" {
 					return err
 				}
 
-				if err == nil {
+				if err == nil && taskState == taskStatusSuccessful {
 					return nil
+				}
+
+				if err == nil && taskState == taskStatusRunning {
+					return provision.NewRetryInterval(time.Second * 10)
 				}
 
 				logger.Info("retrying download")
@@ -209,11 +274,21 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 			return provision.NewRetryInterval(time.Second)
 		}),
 		provision.NewStep("syncVM", func(ctx context.Context, logger *zap.Logger, pctx provision.Context[*resources.Machine]) error {
+			requestID := pctx.GetRequestID()
+
 			if pctx.State.TypedSpec().Value.VmCreateTask != "" {
-				err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VmCreateTask)
+				taskState, err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VmCreateTask)
 				if err != nil {
+					p.releaseNodeReservation(requestID)
+
 					return err
 				}
+
+				if taskState == taskStatusRunning {
+					return provision.NewRetryInterval(time.Second * 10)
+				}
+
+				p.releaseNodeReservation(requestID)
 
 				return nil
 			}
@@ -491,6 +566,8 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 
 			task, err := node.NewVirtualMachine(ctx, vmid, vmOptions...)
 			if err != nil {
+				p.releaseNodeReservation(requestID)
+
 				return err
 			}
 
@@ -501,8 +578,13 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 		}),
 		provision.NewStep("startVM", func(ctx context.Context, _ *zap.Logger, pctx provision.Context[*resources.Machine]) error {
 			if pctx.State.TypedSpec().Value.VmStartTask != "" {
-				if err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VmStartTask); err != nil {
+				taskState, err := p.checkTaskStatus(ctx, pctx.State.TypedSpec().Value.VmStartTask)
+				if err != nil {
 					return err
+				}
+
+				if taskState == taskStatusRunning {
+					return provision.NewRetryInterval(time.Second * 10)
 				}
 			} else {
 				vm, err := p.getVM(ctx, pctx.State.TypedSpec().Value.Node, pctx.State.TypedSpec().Value.Vmid)
@@ -544,6 +626,8 @@ hostname: %s`,
 
 // Deprovision implements infra.Provisioner.
 func (p *Provisioner) Deprovision(ctx context.Context, logger *zap.Logger, machine *resources.Machine, machineRequest *infra.MachineRequest) error {
+	p.releaseNodeReservation(machine.Metadata().ID())
+
 	if machine.TypedSpec().Value.Vmid == 0 {
 		return nil
 	}
@@ -631,21 +715,21 @@ func (p *Provisioner) getVM(ctx context.Context, nodeName string, vmid int32) (*
 	return node.VirtualMachine(ctx, int(vmid))
 }
 
-func (p *Provisioner) checkTaskStatus(ctx context.Context, id string) error {
+func (p *Provisioner) checkTaskStatus(ctx context.Context, id string) (taskStatus, error) {
 	t := proxmox.NewTask(proxmox.UPID(id), p.proxmoxClient)
 
 	if err := t.Ping(ctx); err != nil {
-		return err
+		return taskStatusUnknown, err
 	}
 
 	switch {
 	case t.IsRunning:
-		return provision.NewRetryInterval(time.Second * 10)
+		return taskStatusRunning, nil
 	case t.IsSuccessful:
-		return nil
+		return taskStatusSuccessful, nil
 	}
 
-	return errors.New(t.Status)
+	return taskStatusUnknown, errors.New(t.Status)
 }
 
 func (p *Provisioner) waitForTaskToFinish(ctx context.Context, t *proxmox.Task) error {
@@ -678,6 +762,34 @@ type nodeStatus struct {
 	SameMachineRequestSetVMs int
 }
 
+type nodeReservation struct {
+	MachineRequestSetID string
+	Node                string
+}
+
+type taskStatus uint8
+
+const (
+	taskStatusUnknown taskStatus = iota
+	taskStatusRunning
+	taskStatusSuccessful
+)
+
+func newNodeStatus(name, status string, maxMem, usedMem uint64) (nodeStatus, bool) {
+	if status != "online" || maxMem == 0 {
+		return nodeStatus{}, false
+	}
+
+	if usedMem > maxMem {
+		usedMem = maxMem
+	}
+
+	return nodeStatus{
+		Name:       name,
+		MemoryFree: float64(maxMem-usedMem) / float64(maxMem),
+	}, true
+}
+
 func pickNode(nodeInfoList []nodeStatus) nodeStatus {
 	// Auto-pick node with most free memory and with the least number of machines from the same machine request set
 	slices.SortFunc(nodeInfoList, func(a, b nodeStatus) int {
@@ -685,8 +797,57 @@ func pickNode(nodeInfoList []nodeStatus) nodeStatus {
 			return c
 		}
 
-		return -cmp.Compare(a.MemoryFree, b.MemoryFree)
+		if c := -cmp.Compare(a.MemoryFree, b.MemoryFree); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a.Name, b.Name)
 	})
 
 	return nodeInfoList[0]
+}
+
+func (p *Provisioner) reserveNodeReservation(machineRequestSetID, requestID, node string) {
+	p.reservationsMu.Lock()
+	defer p.reservationsMu.Unlock()
+
+	p.reservations[requestID] = nodeReservation{
+		MachineRequestSetID: machineRequestSetID,
+		Node:                node,
+	}
+}
+
+func (p *Provisioner) getNodeReservation(requestID string) (nodeReservation, bool) {
+	p.reservationsMu.Lock()
+	defer p.reservationsMu.Unlock()
+
+	reservation, ok := p.reservations[requestID]
+
+	return reservation, ok
+}
+
+func (p *Provisioner) countNodeReservations(machineRequestSetID, excludedRequestID, node string) int {
+	p.reservationsMu.Lock()
+	defer p.reservationsMu.Unlock()
+
+	count := 0
+
+	for requestID, reservation := range p.reservations {
+		if requestID == excludedRequestID {
+			continue
+		}
+
+		if reservation.MachineRequestSetID == machineRequestSetID && reservation.Node == node {
+			count++
+		}
+	}
+
+	return count
+}
+
+func (p *Provisioner) releaseNodeReservation(requestID string) {
+	p.reservationsMu.Lock()
+	defer p.reservationsMu.Unlock()
+
+	delete(p.reservations, requestID)
 }
