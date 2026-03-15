@@ -15,6 +15,10 @@
       "type": "string",
       "description": "CEL expression for selecting VM disk image storage"
     },
+    "cloud_init_iso_storage_selector": {
+      "type": "string",
+      "description": "CEL expression for selecting storage for the per-VM cloud-init ISO"
+    },
     "node": {
       "type": "string",
       "description": "Run the VM on a specific Proxmox node"

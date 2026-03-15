@@ -7,6 +7,7 @@ package provider
 import (
 	"testing"
 
+	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 )
 
@@ -115,7 +116,7 @@ func TestNewNodeStatus(t *testing.T) {
 }
 
 func TestNodeReservations(t *testing.T) {
-	p := NewProvisioner(nil)
+	p := NewProvisioner(nil, "")
 
 	p.reserveNodeReservation("set-a", "req-1", "node-a")
 	p.reserveNodeReservation("set-a", "req-1", "node-a")
@@ -135,4 +136,34 @@ func TestNodeReservations(t *testing.T) {
 	p.releaseNodeReservation("req-2")
 
 	require.Equal(t, 0, p.countNodeReservations("set-a", "req-1", "node-a"))
+}
+
+func TestPickISOStorageFromList(t *testing.T) {
+	storages := proxmox.Storages{
+		{Name: "disabled-iso", Enabled: 0, Content: "iso", Type: "dir", Avail: 1},
+		{Name: "images-only", Enabled: 1, Content: "images", Type: "lvmthin", Avail: 2},
+		{Name: "shared-iso", Enabled: 1, Content: "iso,backup", Type: "nfs", Avail: 3},
+		{Name: "local-iso", Enabled: 1, Content: "iso", Type: "dir", Avail: 4},
+	}
+
+	t.Run("falls back to first enabled ISO-capable storage", func(t *testing.T) {
+		storage, err := pickISOStorageFromList("node-a", storages, "")
+
+		require.NoError(t, err)
+		require.Equal(t, "shared-iso", storage.Name)
+	})
+
+	t.Run("selector skips disabled and non-ISO storages", func(t *testing.T) {
+		storage, err := pickISOStorageFromList("node-a", storages, `name == "local-iso"`)
+
+		require.NoError(t, err)
+		require.Equal(t, "local-iso", storage.Name)
+	})
+
+	t.Run("selector returns a clear error when nothing matches", func(t *testing.T) {
+		_, err := pickISOStorageFromList("node-a", storages, `name == "missing"`)
+
+		require.ErrorContains(t, err, `failed to pick ISO storage`)
+		require.ErrorContains(t, err, `missing`)
+	})
 }

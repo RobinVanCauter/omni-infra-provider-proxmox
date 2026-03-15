@@ -102,7 +102,7 @@ var rootCmd = &cobra.Command{
 			opts...,
 		)
 
-		provisioner := provider.NewProvisioner(proxmoxClient)
+		provisioner := provider.NewProvisioner(proxmoxClient, proxmoxConfig.Proxmox.ISOStorageSelector)
 
 		ip, err := infra.NewProvider(meta.ProviderID, provisioner, infra.ProviderConfig{
 			Name:        cfg.providerName,

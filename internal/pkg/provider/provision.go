@@ -34,17 +34,19 @@ const machineRequestTagPrefix = "machine-request."
 
 // Provisioner implements Talos emulator infra provider.
 type Provisioner struct {
-	proxmoxClient *proxmox.Client
+	proxmoxClient             *proxmox.Client
+	defaultISOStorageSelector string
 
 	reservationsMu sync.Mutex
 	reservations   map[string]nodeReservation
 }
 
 // NewProvisioner creates a new provisioner.
-func NewProvisioner(proxmoxClient *proxmox.Client) *Provisioner {
+func NewProvisioner(proxmoxClient *proxmox.Client, defaultISOStorageSelector string) *Provisioner {
 	return &Provisioner{
-		proxmoxClient: proxmoxClient,
-		reservations:  make(map[string]nodeReservation),
+		proxmoxClient:             proxmoxClient,
+		defaultISOStorageSelector: defaultISOStorageSelector,
+		reservations:              make(map[string]nodeReservation),
 	}
 }
 
@@ -220,13 +222,6 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				return err
 			}
 
-			var data Data
-
-			err = pctx.UnmarshalProviderData(&data)
-			if err != nil {
-				return err
-			}
-
 			url = url.JoinPath("image",
 				pctx.State.TypedSpec().Value.Schematic,
 				pctx.GetTalosVersion(),
@@ -248,9 +243,12 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				return err
 			}
 
-			var storage *proxmox.Storage
+			storages, err := node.Storages(ctx)
+			if err != nil {
+				return err
+			}
 
-			storage, err = node.StorageISO(ctx)
+			storage, err := pickISOStorageFromList(node.Name, storages, p.defaultISOStorageSelector)
 			if err != nil {
 				return fmt.Errorf("failed to get storage: %w", err)
 			}
@@ -320,7 +318,12 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 				return err
 			}
 
-			isoStorage, err := node.StorageISO(ctx)
+			storages, err := node.Storages(ctx)
+			if err != nil {
+				return err
+			}
+
+			isoStorage, err := pickISOStorageFromList(node.Name, storages, p.defaultISOStorageSelector)
 			if err != nil {
 				return err
 			}
@@ -592,7 +595,35 @@ func (p *Provisioner) ProvisionSteps() []provision.Step[*resources.Machine] {
 					return err
 				}
 
-				err = vm.CloudInit(ctx,
+				var data Data
+
+				if err = pctx.UnmarshalProviderData(&data); err != nil {
+					return err
+				}
+
+				node, err := p.proxmoxClient.Node(ctx, pctx.State.TypedSpec().Value.Node)
+				if err != nil {
+					return err
+				}
+
+				cloudInitISOStorageSelector := p.defaultISOStorageSelector
+				if data.CloudInitISOStorageSelector != "" {
+					cloudInitISOStorageSelector = data.CloudInitISOStorageSelector
+				}
+
+				storages, err := node.Storages(ctx)
+				if err != nil {
+					return err
+				}
+
+				cloudInitStorage, err := pickISOStorageFromList(node.Name, storages, cloudInitISOStorageSelector)
+				if err != nil {
+					return fmt.Errorf("failed to get cloud-init ISO storage: %w", err)
+				}
+
+				err = p.uploadCloudInitISO(ctx,
+					vm,
+					cloudInitStorage,
 					"ide0",
 					pctx.ConnectionParams.JoinConfig,
 					fmt.Sprintf(`instance-id: %s

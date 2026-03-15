@@ -6,27 +6,28 @@ package provider
 
 // Data is the provider custom machine config.
 type Data struct {
-	Balloon         *bool            `yaml:"balloon,omitempty"`
-	Node            string           `yaml:"node,omitempty"`
-	StorageSelector string           `yaml:"storage_selector,omitempty"`
-	NetworkBridge   string           `yaml:"network_bridge"`
-	Hugepages       string           `yaml:"hugepages,omitempty"`
-	MachineType     string           `yaml:"machine_type,omitempty"`
-	CPUType         string           `yaml:"cpu_type,omitempty"`
-	DiskAIO         string           `yaml:"disk_aio,omitempty"`
-	DiskCache       string           `yaml:"disk_cache,omitempty"`
-	AdditionalDisks []AdditionalDisk `yaml:"additional_disks,omitempty"`
-	AdditionalNICs  []AdditionalNIC  `yaml:"additional_nics,omitempty"`
-	PCIDevices      []PCIDevice      `yaml:"pci_devices,omitempty"`
-	Vlan            uint64           `yaml:"vlan"`
-	Memory          uint64           `yaml:"memory"`
-	Sockets         int              `yaml:"sockets"`
-	DiskSize        int              `yaml:"disk_size"`
-	Cores           int              `yaml:"cores"`
-	DiskIOThread    bool             `yaml:"disk_iothread,omitempty"`
-	NUMA            bool             `yaml:"numa,omitempty"`
-	DiskDiscard     bool             `yaml:"disk_discard,omitempty"`
-	DiskSSD         bool             `yaml:"disk_ssd,omitempty"`
+	Balloon                     *bool            `yaml:"balloon,omitempty"`
+	Node                        string           `yaml:"node,omitempty"`
+	StorageSelector             string           `yaml:"storage_selector,omitempty"`
+	CloudInitISOStorageSelector string           `yaml:"cloud_init_iso_storage_selector,omitempty"`
+	NetworkBridge               string           `yaml:"network_bridge"`
+	Hugepages                   string           `yaml:"hugepages,omitempty"`
+	MachineType                 string           `yaml:"machine_type,omitempty"`
+	CPUType                     string           `yaml:"cpu_type,omitempty"`
+	DiskAIO                     string           `yaml:"disk_aio,omitempty"`
+	DiskCache                   string           `yaml:"disk_cache,omitempty"`
+	AdditionalDisks             []AdditionalDisk `yaml:"additional_disks,omitempty"`
+	AdditionalNICs              []AdditionalNIC  `yaml:"additional_nics,omitempty"`
+	PCIDevices                  []PCIDevice      `yaml:"pci_devices,omitempty"`
+	Vlan                        uint64           `yaml:"vlan"`
+	Memory                      uint64           `yaml:"memory"`
+	Sockets                     int              `yaml:"sockets"`
+	DiskSize                    int              `yaml:"disk_size"`
+	Cores                       int              `yaml:"cores"`
+	DiskIOThread                bool             `yaml:"disk_iothread,omitempty"`
+	NUMA                        bool             `yaml:"numa,omitempty"`
+	DiskDiscard                 bool             `yaml:"disk_discard,omitempty"`
+	DiskSSD                     bool             `yaml:"disk_ssd,omitempty"`
 }
 
 // AdditionalDisk represents an additional disk configuration.
